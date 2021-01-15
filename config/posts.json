@@ -1,0 +1,187 @@
+{
+  "posts": [
+    {
+      "content": ">> Ref: \r\n[https://www.cnblogs.com/wellp/p/8877990.html](https://www.cnblogs.com/wellp/p/8877990.html)\r\n[https://blog.csdn.net/weixin_41690997/article/details/105563830?depth_1-](https://blog.csdn.net/weixin_41690997/article/details/105563830?depth_1-)\r\n\r\n## 介绍\r\n　　LOAM[1]是Ji Zhang于2014年提出的使用激光雷达完成定位与三维建图的算法，即**Lidar Odometry and Mapping**。之后许多激光SLAM算法借鉴了LOAM中的一些思想（改进版的LOAM），可以说学习LOAM对学习3D激光SLAM很有帮助。\r\n　　整个LOAM本质就是一个激光里程计，没有闭环检测，也就没有图优化框架在里面，该算法把SLAM问题分为两个算法同时运行，实现实时建图，一个odometry算法，10Hz；另一个mapping算法，1Hz。（LOAM**核心思想**是将定位和建图的分割，通过两个算法：一个是执行高频率的里程计但是低精度的运动估计（定位），另一个算法在比定位低一个数量级的频率执行匹配和配准点云信息（建图和校正里程计）。将这两个算法结合就获得了高精度、实时性的激光里程计。）两个算法都是从点云中提取尖锐的边（sharp edges）和平整表面（planar surface）特征点，然后进行特征匹配，来估计lidar的运动以及fine match with local map，匹配的过程核心思想还是基于距离的判断，LOAM里面的匹配（correspondence）并不是简单的feature point到feature point的，而是edge point 到 edge line以及planar point 到 planar patch，在后续运动估计中用到的dis也是点到线的距离以及点到面的距离，所以我感觉匹配的过程就像是一个基于feature的点到面（线）的ICP算法；当然odometry和mapping算法的edge line 和 planar patch的确定略有不同。\r\n　　**LOAM通过点云特征提取和点云匹配来解决低漂移和低计算的问题**。我们知道匹配的问题分为scan-to-scan、scan-to-map、map-to-map。而三者各有特点，首先说scan-to-scan匹配：优点是计算量小速度快，缺点是误差累计大，长距离误差累计后地图就无法看了。map-to-map的匹配：优点是精度高，误差累计小；缺点就是计算量大，实时性压力大。scan-to-map的匹配居中。LOAM的优点就是很好地利用力匹配的优缺点，首先，虽然scan-to-scan匹配精度差，但是我们可以只是使用它做一个获取粗的里程计，用获取的结果用于去除匀速运动造成的运动畸变，由于scan-to-scan的计算量较小因此我们可以高频执行。其次，有了里程计校正后的点云数据，接下来我们就可以做一个map-to-map的匹配了。但是map-to-map存在计算量大的问题，因此 我们可以让其执行的频率降低。这样的高低频率结合就保证了计算量的同时又兼具了精度。\r\n　　LOAM算法由四个节点构成。分别完成特征提取，高频低精度odom，低频高精度odom，双频odom融合的功能，每个节点以rosnode形式存在，也就是独立的进程\r\n       <font color=red>**LOAM的整体思想就是将复杂的SLAM问题分为：1. 高频的运动估计； 2. 低频的环境建图。**</font>\r\n### 1.1 节点简述\r\n+ **a. ScanRegistration**： 　　\r\n　　根据VLP16的激光扫描模型, 对单帧点云（paper中称为一个Sweep）进行分线束（分为16束）, 每束称为一个Scan， 并记录每个点所属线束和每个点在此帧电云内的相对扫描时间（相对于本帧第一个点）。 针对单个Scan提取特征点,因为角分辨率越大, 代表越远的物体, 反射的两点距离越大, 中间丢失的信息越多。因此, LOAM没有针对Scan和Scan之间的点的关联性提取和描述特征, 而是直接针对单个Scan提取特征. 而相对时间会在laserOdometry中用于运动补偿.所有Scan的特征点,拼到两个点云中(因为是corner和surface两种特征点,所以是两个点云).至此,每帧点云,输出两帧对应的特征点云, 给下一个节点laserOdometry。\r\n\r\n+ **b. laserOdometry**:\r\n　　实现运动补偿和帧间配准.每帧激光都会参与（所以帧率同VLP16的扫描帧率，10hz）.通过对每一帧激光的配准,可以得到一个精度较差的ODOM,帧与帧配准的初始POSE可以由IMU得到，或者在没有IMU的时候由匀速运动模型(简单的说就是假设这一帧运动量与上一帧一致)得到。\r\n本节点输出的ODOM频率为10hz.此ODOM的作用:\r\n（a） 在laserMapping中用于位姿的预测。\r\n（b） 在transformMaintenance中为laserMapping输出的低频ODOM提供插值,以获得高频(10HZ)的ODOM.\r\n在实际应用中,帧间匹配实现的ODOM,可以由IMU, 视觉里程计,底盘编码器等替代.而运动补偿在高速场景是不可或缺的\r\n\r\n+ **C. laserMapping**:\r\n　　本节点使用实现一个较为完整的SLAM过程，主要工作：\r\n（a）通过多帧的激光特征点云基于POSE拼接，形成特征点云地图。由于包含conrner和surface两种，所以要建立两种地图。\r\n（b）将新入的帧与地图做配准，得到更精确的POSE，然后按照ａ进行建图。\r\n实际过程中由于单帧计算量大，所以采取每隔几帧配准一次（比如没５帧配一次，也就是２Hz）。如果一帧配一次，transformMaintenance也就没有存在的意义。\r\n这个地图可以作为离线地图。用作定位使用。\r\n当然这个地图功能还不完善，比如没有回环检测，这时候可以参考LeGO-LOAM，此文运用iSAM和ICP实现回环检测和全局优化建图。\r\n## 2 算法\r\n### 2.1 系统整体架构\r\n　　LOAM主要包含两个模块，一个是Lidar Odometry，即使用激光雷达做里程计计算两次扫描之间的位姿变换；另一个是Lidar Mapping，利用多次扫描的结果构建地图，细化位姿轨迹。由于Mapping部分计算量较大，所以计算频率较低（1Hz），由Mapping校准细化Odometry过程中计算出来的轨迹。\r\n \r\n### 2.2 Lidar Odometry算法\r\n　　Lidar Odometry是通过Lidar的两次扫描匹配，计算这两次扫描之间Lidar的位姿变换，从而用作里程计Odometry。既然提到了两次扫描的匹配，自然而然想到了经典的ICP算法。然而LOAM并没有采用全部的激光点进行匹配，而是筛选出了两类特征点，分别是角点和平面点。\r\n　　所谓**角点**，是当前激光扫描线束上曲率较大的点；而**平面点**，即曲率较小的点。在匹配时，首先提取当前扫描中的角点和平面点，对于角点，可以认为是物理世界中直线元素的采样，所以计算到上一次扫描中对应直线的距离；而对于平面点，认为是物理世界平面元素的采样，所以计算到上一次扫描中对应平面的距离。通过不断优化，使距离最小，从而得到最优的位姿变换参数。\r\n#### 2.2.1 角点到直线距离的计算\r\n　　计算角点到对应直线距离时，需要确定对应直线的方程，才能够计算距离。作者认为，可以有如下假设：角点是雷达某个线束与物理世界两个平面夹角相交时的采样，那么这个线束相邻的雷达扫描线束也会与这个平面夹角相交，所以这个平面夹角的直线可以用前后两次扫描的角点进行标识。\r\n ![](https://laichao2018.github.io/post-images/1605228996151.png)图1：两种特征点提取示意\r\n\r\n\r\n　　具体而言，当获得当前某一个角点时，首先根据假设的运动参数（上一次运动参数作为这一次优化的初始），计算这个角点在上一次扫描时的坐标，之后查找上一次扫描中最近邻的角点，并在相邻的雷达扫描线束中搜索最近的角点，从而得到了直线方程，便能够计算点到之间距离。\r\n#### 2.2.2 平面点到平面距离的计算\r\n计算平面点到对应平面距离时，也需要首先拿到平面的方程，即平面上一点与平面的法向量。与角点对应直线搜索方式类似，首先找上一次扫描中最近邻的平面点，之后在同一个扫描线数和不同的线束上各提取一个平面点，这样共得到了3个不共线的平面点，唯一确定了平面，从而计算平面点到平面的距离。\r\n#### 2.2.3 一些其他细节\r\n1.  在角点和平面点的选择上，为了使分布更加均匀，通常将激光雷达一圈的扫描均匀分成几个部分，分别在每个部分中提取曲率最大（角点）和最小（平面点）的几个点。\r\n2. 在激光雷达的一次扫描过程中，由于运动，采集到的点云会有运动畸变，所以在LOAM中点云会通过预估的运动参数去畸变进行对齐\t\r\n3. 雷达扫描到的一些数据点是不稳定的，作者认为有两种不稳定数据点，如下图所示。一种是采集面与扫描面基本平行，另一种是被遮挡。在获得一次激光雷达扫描的点云后，这两种不稳定点会被首先去除。\r\n \r\n ![](https://laichao2018.github.io/post-images/1605229321374.png)图2：两种不稳定点示意\r\n\r\n### 2.3 Lidar Mapping算法\r\n　　Mapping部分的意义是，通过与多次扫描构成的地图进行匹配，得到Lidar Odometry中利用两帧之间计算位姿产生的漂移，从而对轨迹进行细化。如下图所示：\r\n \r\n![](https://laichao2018.github.io/post-images/1605229335638.png)图3：扫描的轨迹和地图\r\n\r\n　　图中，分别表示前k次扫描的轨迹（蓝色曲线）和地图（黑色直线），而最新的轨迹为。将k+1次雷达扫描到通过Odometry得到的映射到地图坐标系中，得到了未经校准的地图，可以看出存在一定的误差，并没有与原有地图对齐。此时通过一次Lidar Mapping，可以消掉这部分的误差，从而校准位姿参数。\r\n ![](https://laichao2018.github.io/post-images/1605229356047.png)\r\n　　如上图所示，在Mapping时，LOAM维护了一个以当前位置为中心，具有多个block的子地图，论文中指出这个子地图是10m的立方体。当Lidar采集到的点落入到这个子地图的某些block时，将从这个子地图提取出去对应的block，然后在这些block中像特征点提取那样，提取当前扫描中角点和平面点近邻的对应点，但有不同之处，并不像第2小节那样提取2个近邻角点确定直线或者3个平面点确定平面，而是提取更多的点进行拟合，因为子地图是多次扫描构成的结果。\r\n　　对于当前扫描的一个角点，提取对应子地图中多个近邻角点，通过奇异值分解求出这些角点的主方向，从而的到直线方程，从而计算点到直线距离；对于平面点，通过寻找最小特征值对应的向量得到拟合平面的法向量，从而计算点到平面距离。再进行优化，得到对齐扫描与子地图的位姿纠正参数，之后将原有的轨迹进行纠正，便得到了细化的轨迹。\r\n　　mapping算法的match跟odometry算法的match过程略有不同（主要体现在correspondence确定方式的不同），在 中提取特征点的方式跟之前一样，也就是根据c值判断一个点是edge or planar point，但是特征点的数量是odometry算法的10倍，然后在Qk中找特征点的correspondence，在odometry算法中，correspondence的确定是为了最快的计算速度（基于最近邻的思路找对应线以及对应面），而mapping算法是通过对特征点周围的点云簇进行PCA主成分分析（求点云簇的协方差矩阵的特征值和特征向量），来找到对应边和对应面。correspondence确定后的过程就跟之前一样了，实现将 配准到local map.\r\n### 2.4 补充说明\r\n　　LOAM一文中提出，可以通过IMU进行辅助。所谓“辅助”就是在激光雷达两次扫描之间，利用IMU得到较为准确的变化轨迹，从而进行点云畸变的去除，从而不需要靠上次扫描获得的运动参数插值对这次的畸变进行去除，能够提升精度。但IMU的数据并没有参与到优化当中，所以IMU在LOAM算法中只起到了辅助作用，而后续一些其他3D激光雷达算法，例如LINS[3]，Lio-mapping[4]和LIO-SAM[5]等，利用IMU进行了紧耦合的优化，取得了更好的效果。\r\n## 3 代码\r\n　　对简化版的**开源代码A-LOAM**进行简单介绍。\r\n　　LOAM的作者曾经开源了LOAM的代码，但由于某些原因又取消了开源，现在网上也流传着一些当时的片段或者牛人的实现。而A-LOAM是LOAM的一个简化版本，去掉了IMU以及一些其他细节，采用了Eigen，ceres等替代了原有LOAM代码中的手动实现，非常适合学习LOAM思想，也适合新手入门3D激光SLAM。A-LOAM的链接是：https://github.com/HKUST-Aerial-Robotics/A-LOAM\r\n### 3.1 代码概览\r\n　　A-LOAM代码通过ROS运行，主要有3个节点，分别是：ascanResigtration, alaserOdometry和alaserMapping，对应特征点提取、里程计计算和mapping细化三部分。整体的结构如下：\r\n \r\n![](https://laichao2018.github.io/post-images/1605229368259.png)图5 A-LOAM代码结构\r\n\t\r\n+ ascanResigtration：处理Lidar输入的点云，提取并发布角点、平面点以及简单处理后的完整点云；\r\n+ alaserOdometry：接收特征点，计算位姿参数（轨迹）并发布\r\n+ alaserMapping：接收Lidar的点云与Odometry计算的轨迹，进行细化，得到精确的轨迹和地图并发布\r\n### 3.2 代码学习资料\r\n> 注意有些注释的是LOAM，有些是A-LOAM，基本上LOAM的注释涵盖了A-LOAM\r\n\r\n\r\n1. [LOAM中文注释版](https://github.com/cuitaixiang/LOAM_NOTED)\r\n2. [LOAM笔记及A-LOAM源码阅读](https://www.cnblogs.com/wellp/p/8877990.html)\r\n3. [LOAM代码解析](https://blog.csdn.net/liuyanpeng12333/article/details/82737181ALOAM)\r\n4. [试跑及程序注释](https://blog.csdn.net/unlimitedai/article/details/105711240)\r\n5. [文章，代码解读](https://blog.csdn.net/nksjc/article/details/76401092)\r\n### 3.3 其他\r\n1. [SLAM笔记](https://blog.csdn.net/kamfai_row/category_10126073.html)\r\n\r\n## 4 补充\r\n> Low-drift and real-time lidar odometry and mapping\r\n\r\n\r\n　　**即LOAM，实现了低漂移运动估计在6自由度和低计算复杂度。**\r\n使这种性能水平成为可能的关键思想是将寻求同时优化大量变量的典型复杂问题（如图1所示）划分为两个算法。一种算法在高频率但低保真度下执行里程计，以估计激光扫描仪在环境中移动的速度。虽然没有必要，但如果有一个IMU，它可以提供一个运动先验，并有助于解释总的，高频的运动。第二种算法以一个数量级的低频率运行，用于点云的精细匹配和配准。具体来说，这两种算法都提取出位于边缘和平面上的特征点，并将特征点分别与边缘线段和平面面片相匹配。在里程算法中，特征点的对应关系是通过保证计算速度来实现的，而在映射算法中则是通过保证精度来实现的。\r\n\r\n　　该方法首先解决了一个比较容易实现的在线速度估计问题，然后通过批量优化映射，得到高精度的运动估计和地图。并行算法结构保证了实时求解问题的可行性。此外，由于运动估计是在更高的频率下进行的，所以映射有足够的时间来提高精度。当交错运行比里程算法慢一个数量级时，映射算法包含大量特征点并使用足够多的迭代来收敛。\r\n论文贡献：\r\n+ 提出了一个采用双层优化的软件系统，在线估计自我运动并建立地图；\r\n+ 我们精心实现了几何特征的检测和匹配，以满足系统的要求：里程计算法中的特征匹配粗糙且快速，以保证高频率，并且在映射算法中是精确而缓慢的，以确保低漂移；\r\n+ 我们使用涵盖各种环境类型的大量数据集对该方法进行了彻底测试；\r\n+ 我们真诚地尝试将我们的工作呈现到更详细的层次，以使读者能够重新实现该方法。\r\n\r\n",
+      "data": {
+        "title": "[专业知识] LOAM论文 & 源码解读",
+        "date": "2020-11-13 08:51:58",
+        "tags": [
+          "SLAM",
+          "专业知识"
+        ],
+        "published": true,
+        "hideInList": false,
+        "feature": "/post-images/zhuan-ye-zhi-shi-loam-lun-wen-and-yuan-ma-jie-du.jpg",
+        "isTop": false
+      },
+      "isEmpty": false,
+      "excerpt": "",
+      "abstract": "",
+      "fileName": "zhuan-ye-zhi-shi-loam-lun-wen-and-yuan-ma-jie-du"
+    },
+    {
+      "content": "## 1. CMake介绍\r\n+ CMake是一个<font color=red>跨平台的构建工具</font>，可以用简单的语句来描述所有平台的安装(编译过程)。能够输出各种各样的makefile或者project文件。CMake 并不直接建构出最终的软件，而是产生其他工具的脚本（如Makefile ），然后再依这个工具的构建方式使用。\r\n+ CMake是一个比make更高级的编译配置工具，它可以根据不同平台、不同的编译器，生成相应的Makefile或者vcproj项目。从而达到跨平台的目的。Android Studio利用CMake生成的是ninja，ninja是一个小型的关注速度的构建系统。我们不需要关心ninja的脚本，知道怎么配置cmake就可以了。从而可以看出cmake其实是一个跨平台的支持产出各种不同的构建脚本的一个工具。\r\n\r\n## 2. CMake基本使用\r\n#### 1. 添加头文件目录INCLUDE_DIRECTORIES\r\n语法：\r\n```\r\ninclude_directories([AFTER|BEFORE] [SYSTEM] dir1 [dir2 ...])\r\n```\r\n它相当于g++选项中的-I参数的作用，也相当于环境变量中增加路径到CPLUS_INCLUDE_PATH变量的作用。\r\n```\r\ninclude_directories(../../../thirdparty/comm/include)\r\n```\r\n#### 2. 添加需要链接的库文件目录LINK_DIRECTORIES\r\n语法：\r\n```\r\nlink_directories(directory1 directory2 ...)\r\n```\r\n它相当于g++命令的-L选项的作用，也相当于环境变量中增加LD_LIBRARY_PATH的路径的作用。\r\n```\r\nlink_directories(\"/home/server/third/lib\")\r\n```\r\n#### 3. 查找库所在目录FIND_LIBRARY\r\n语法：\r\n```\r\nA short-hand signature is:\r\n\r\nfind_library (<VAR> name1 [path1 path2 ...])\r\nThe general signature is:\r\n\r\nfind_library (\r\n          <VAR>\r\n          name | NAMES name1 [name2 ...] [NAMES_PER_DIR]\r\n          [HINTS path1 [path2 ... ENV var]]\r\n          [PATHS path1 [path2 ... ENV var]]\r\n          [PATH_SUFFIXES suffix1 [suffix2 ...]]\r\n          [DOC \"cache documentation string\"]\r\n          [NO_DEFAULT_PATH]\r\n          [NO_CMAKE_ENVIRONMENT_PATH]\r\n          [NO_CMAKE_PATH]\r\n          [NO_SYSTEM_ENVIRONMENT_PATH]\r\n          [NO_CMAKE_SYSTEM_PATH]\r\n          [CMAKE_FIND_ROOT_PATH_BOTH |\r\n           ONLY_CMAKE_FIND_ROOT_PATH |\r\n           NO_CMAKE_FIND_ROOT_PATH]\r\n)\r\n```\r\ncmake会在目录中查找，如果所有目录中都没有，值RUNTIME_LIB就会被赋为NO_DEFAULT_PATH\r\n```\r\nFIND_LIBRARY(RUNTIME_LIB rt /usr/lib  /usr/local/lib NO_DEFAULT_PATH)\r\n```\r\n#### 4. 添加需要链接的库文件路径LINK_LIBRARIES\r\n语法：\r\n```\r\nlink_libraries(library1 <debug | optimized> library2 ...)\r\n```\r\n可以链接一个，也可以多个，中间使用空格分隔.\r\n```\r\n# 直接是全路径link_libraries(“/home/server/third/lib/libcommon.a”)\r\n# 下面的例子，只有库名，cmake会自动去所包含的目录搜索link_libraries(iconv)# 传入变量link_libraries(${RUNTIME_LIB})\r\n# 也可以链接多个link_libraries(\"/opt/MATLAB/R2012a/bin/glnxa64/libeng.so\"　\"/opt/MATLAB/R2012a/bin/glnxa64/libmx.so\")\r\n```\r\n#### 5. 设置要链接的库文件的名称TARGET_LINK_LIBRARIES \r\n语法：\r\n```\r\ntarget_link_libraries(<target> [item1 [item2 [...]]]\r\n                      [[debug|optimized|general] <item>] ...)\r\n```\r\n例如：\r\n```\r\n# 以下写法都可以： \r\ntarget_link_libraries(myProject comm)       # 连接libhello.so库，默认优先链接动态库\r\ntarget_link_libraries(myProject libcomm.a)  # 显示指定链接静态库\r\ntarget_link_libraries(myProject libcomm.so) # 显示指定链接动态库\r\n\r\n# 再如：\r\ntarget_link_libraries(myProject libcomm.so)　　#这些库名写法都可以。\r\ntarget_link_libraries(myProject comm)\r\ntarget_link_libraries(myProject -lcomm)\r\n```\r\n#### 6. 为工程生成目标文件\r\n语法：\r\n```\r\nadd_executable(<name> [WIN32] [MACOSX_BUNDLE]\r\n               [EXCLUDE_FROM_ALL]\r\n               source1 [source2 ...])\r\n```\r\n简单的例子如下：\r\n```\r\nadd_executable(demo\r\n        main.cpp\r\n)\r\n```\r\n## 3. CMake案例\r\n贴一个完整的例子:\r\n(另外，使用cmake生成makefile之后，make edit_cache可以编辑编译选项。)\r\n```\r\ncmake_minimum_required (VERSION 2.6)\r\n\r\nINCLUDE_DIRECTORIES(../../thirdparty/comm)\r\n\r\nFIND_LIBRARY(COMM_LIB comm ../../thirdparty/comm/lib NO_DEFAULT_PATH)\r\nFIND_LIBRARY(RUNTIME_LIB rt /usr/lib  /usr/local/lib NO_DEFAULT_PATH)\r\n\r\nlink_libraries(${COMM_LIB} ${RUNTIME_LIB})\r\n\r\nADD_DEFINITIONS(\r\n-O3 -g -W -Wall\r\n -Wunused-variable -Wunused-parameter -Wunused-function -Wunused\r\n -Wno-deprecated -Woverloaded-virtual -Wwrite-strings\r\n -D__WUR= -D_REENTRANT -D_FILE_OFFSET_BITS=64 -DTIXML_USE_STL\r\n)\r\n\r\nadd_library(lib_demo\r\n        cmd.cpp\r\n        global.cpp\r\n        md5.cpp\r\n)\r\n\r\nlink_libraries(lib_demo)\r\nadd_executable(demo\r\n        main.cpp\r\n)\r\n\r\n# link library in static mode\r\ntarget_link_libraries(demo libuuid.a)\r\n```\r\n## 4. 结束语\r\nCSDN上的[这篇博客](https://blog.csdn.net/zdaiot/article/details/83066168)也讲的十分详细可以去看看\r\n## 5. 参考博客\r\n+ [https://www.cnblogs.com/binbinjx/p/5626916.html](https://www.cnblogs.com/binbinjx/p/5626916.html)\r\n\r\n",
+      "data": {
+        "title": "[开发工具] CMake常用功能",
+        "date": "2020-11-07 15:37:06",
+        "tags": [
+          "技术",
+          "C++"
+        ],
+        "published": true,
+        "hideInList": false,
+        "feature": "/post-images/kai-fa-gong-ju-cmake-chang-yong-gong-neng.jpg",
+        "isTop": false
+      },
+      "isEmpty": false,
+      "excerpt": "",
+      "abstract": "",
+      "fileName": "kai-fa-gong-ju-cmake-chang-yong-gong-neng"
+    },
+    {
+      "content": "## 1. 前言\r\n\r\n\\+ C++中的虚函数的作用主要是***\\*实现了多态\\****的机制。关于多态，简而言之就是用父类型别的指针指向其子类的实例，然后通过父类的指针调用实际子类的成员函数。这种技术可以让父类的指针有“多种形态”，这是一种泛型技术。所谓泛型技术，说白了就是试图使用不变的代码来实现可变的算法。比如：模板技术，RTTI技术，虚函数技术，要么是试图做到在编译时决议，要么试图做到***\\*运行时决议\\****。\r\n\r\n## 2. 虚函数表\r\n\r\n对C++ 了解的人都应该知道虚函数（Virtual Function）是通过一张虚函数表（Virtual Table）来实现的。简称为V-Table。在这个表中，主是要一个类的虚函数的地址表，这张表解决了继承、覆盖的问题，保证其容真实反应实际的函数。这样，在有虚函数的类的实例中这个表被分配在了这个实例的内存中，所以，当我们用父类的指针来操作一个子类的时候，这张虚函数表就显得由为重要了，它就像一个地图一样，指明了实际所应该调用的函数。\r\n\r\nC++的编译器应该是保证虚函数表的指针存在于对象实例中最前面的位置（这是为了保证取到虚函数表的有最高的性能——如果有多层继承或是多重继承的情况下）。 这意味着我们通过对象实例的地址得到这张虚函数表，然后就可以遍历其中函数指针，并调用相应的函数。\r\n\r\n虚表指针的名字也会被编译器更改，所以在多继承的情况下，类的内部可能存在多个虚表指针。通过不同的名字被编译器标识。\r\n\r\n假设我们有这样的一个类：\r\n\r\n```cpp\r\nclass Base {\r\n​    public:\r\n​      virtual void f() { cout << \"Base::f\" << endl; }\r\n​      virtual void g() { cout << \"Base::g\" << endl; }\r\n​      virtual void h() { cout << \"Base::h\" << endl; }\r\n};\r\n```\r\n\r\n按照上面的说法，可以通过Base的实例来得到虚函数表。 下面是实际例程：\r\n\r\n```cpp\r\ntypedef void(*Fun)(void);\r\nBase b;\r\nFun pFun = NULL;\r\ncout << \"虚函数表地址：\" << (int*)(&b) << endl;\r\ncout << \"虚函数表 — 第一个函数地址：\" << (int*)*(int*)(&b) << endl;\r\n// Invoke the first virtual function\r\npFun = (Fun)*((int*)*(int*)(&b));\r\npFun();\r\n```\r\n\r\n实际运行经果如下：(Windows XP+VS2003, Linux 2.6.22 + GCC 4.1.3)\r\n\r\n>**虚函数表地址：0012FED4**\r\n> **虚函数表 — 第一个函数地址：0044F148**\r\n>**Base::f**\r\n\r\n通过这个示例，可以看到，我们可以通过强行把&b转成int *，取得虚函数表的地址，然后，再次取址就可以得到第一个虚函数的地址了，也就是Base::f()，这在上面的程序中得到了验证（把int* 强制转成了函数指针）。通过这个示例，我们就可以知道如果要调用Base::g()和Base::h()，其代码如下：\r\n\r\n```cpp\r\n(Fun)*((int*)*(int*)(&b)+0); *// Base::f()*\r\n(Fun)*((int*)*(int*)(&b)+1); *// Base::g()*\r\n(Fun)*((int*)*(int*)(&b)+2); *// Base::h()*\r\n```\r\n画个图解释一下。如下所示:\r\n\r\n![](https://laichao2018.github.io/post-images/1604645798579.jpg)\r\n\r\n注意：在上面这个图中，在虚函数表的最后多加了一个结点，这是虚函数表的结束结点，就像字符串的结束符“*/0*”一样，其标志了虚函数表的结束。这个结束标志的值在不同的编译器下是不同的。在*WinXP+VS2003*下，这个值是*NULL*。而在*Ubuntu 7.10 + Linux 2.6.22 + GCC 4.1.3*下，这个值是如果*1*，表示还有下一个虚函数表，如果值是*0*，表示是最后一个虚函数表。\r\n\r\n下面，将分别说明“无覆盖”和“有覆盖”时的虚函数表的样子。没有覆盖父类的虚函数是毫无意义的。我之所以要讲述没有覆盖的情况，主要目的是为了给一个对比。在比较之下，我们可以更加清楚地知道其内部的具体实现。\r\n\r\n## 3. 继承与虚函数表\r\n#### 3.1 一般继承（无虚函数覆盖）\r\n下面，再来看看继承时的虚函数表是什么样的。假设有如下所示的一个继承关系：\r\n![](https://laichao2018.github.io/post-images/1604645833272.jpg)\r\n请注意，在这个继承关系中，子类没有重载任何父类的函数。那么，在派生类的实例中，其虚函数表如下所示\r\n对于实例：Derive d; 的虚函数表如下：\r\n![](https://laichao2018.github.io/post-images/1604645838066.JPG)\r\n我们可以看到下面几点：\r\n1. 虚函数按照其声明顺序放于表中。\r\n2. 父类的虚函数在子类的虚函数前面。\r\n\r\n#### 3.2 一般继承（有虚函数覆盖）\r\n覆盖父类的虚函数是很显然的事情，不然，虚函数就变得毫无意义。下面，我们来看一下，如果子类中有虚函数重载了父类的虚函数，会是一个什么样子？假设，有下面这样的一个继承关系。\r\n\r\n![](https://laichao2018.github.io/post-images/1604645844186.jpg)\r\n\r\n为了看到被继承过后的效果，在这个类的设计中，只覆盖了父类的一个函数：f()。那么，对于派生类的实例，其虚函数表会是下面的一个样子：\r\n![](https://laichao2018.github.io/post-images/1604645851133.JPG)\r\n\r\n我们从表中可以看到下面几点，\r\n1. 覆盖的f()函数被放到了虚表中原来父类虚函数的位置。\r\n2. 没有被覆盖的函数依旧。\r\n这样，我们就可以看到对于下面这样的程序，\r\n```cpp\r\nBase *b = new Derive();\r\nb->f();\r\n```\r\n由b所指的内存中的虚函数表的<font color=red>f()</font>的位置已经被<font color=red>Derive::f()</font>函数地址所取代，于是在实际调用发生时，是Derive::f()被调用了。这就实现了多态。\r\n\r\n#### 3.3 多重继承（无虚函数覆盖）\r\n下面，再看看多重继承中的情况，假设有下面这样一个类的继承关系。注意：子类并没有覆盖父类的函数：\r\n\r\n![](https://laichao2018.github.io/post-images/1604645857538.png)\r\n\r\n对于子类实例中的虚函数表，是下面这个样子：\r\n\r\n![](https://laichao2018.github.io/post-images/1604645862196.png)\r\n\r\n我们可以看到：\r\n1. 每个父类都有自己的虚表。\r\n2. 子类的成员函数被放到了第一个父类的表中。（所谓的第一个父类是按照声明顺序来判断的）\r\n这样做就是为了解决不同的父类类型的指针指向同一个子类实例，而能够调用到实际的函数。\r\n\r\n#### 3.4 多重继承（有虚函数覆盖）\r\n下面再来看看，如果发生虚函数覆盖的情况。下图中，我们在子类中覆盖了父类的f()函数。\r\n\r\n![](https://laichao2018.github.io/post-images/1604645869560.png)\r\n\r\n下面是对于子类实例中的虚函数表的图：\r\n\r\n![](https://laichao2018.github.io/post-images/1604645874974.jpg)\r\n\r\n可以看见，三个父类虚函数表中的f()的位置被替换成了子类的函数指针。这样，我们就可以任一静态类型的父类来指向子类，并调用子类的f()了。如：\r\n```cpp\r\n  Derive d;\r\n        Base1 *b1 = &d;\r\n        Base2 *b2 = &d;\r\n        Base3 *b3 = &d;\r\n        b1->f();     //Derive::f()\r\n        b2->f();     //Derive::f()\r\n        b3->f();     //Derive::f() \r\n        b1->g();    //Base1::g()\r\n        b2->g();    //Base2::g()\r\n        b3->g();    //Base3::g()\r\n```\r\n\r\n## 4. 安全性\r\n**水可载舟，亦可覆舟。**\r\n#### 4.1 通过父类型的指针访问子类自己的虚函数\r\n子类没有重载父类的虚函数是一件毫无意义的事情。因为多态也是要基于函数重载的。虽然在上面的图中我们可以看到Base1的虚表中有Derive的虚函数，但我们根本不可能使用下面的语句来调用子类的自有虚函数：\r\n```cpp\r\nBase1 *b1 = new Derive();\r\nb1->f1();  //编译出错\r\n```\r\n任何妄图使用父类指针想调用子类中的未覆盖父类的成员函数的行为都会被编译器视为非法，所以，这样的程序根本无法编译通过。但在运行时，我们可以通过指针的方式访问虚函数表来达到违反C++语义的行为。（关于这方面的尝试，通过阅读后面附录的代码，相信你可以做到这一点）\r\n\r\n#### 4.2 访问non-public的虚函数\r\n另外，如果父类的虚函数是private或是protected的，但这些非public的虚函数同样会存在于虚函数表中，所以，我们同样可以使用访问虚函数表的方式来访问这些non-public的虚函数，这是很容易做到的。如：\r\n```cpp\r\nclass Base {\r\n    private:\r\n            virtual void f() { cout << \"Base::f\" << endl; \r\n}; \r\n\r\nclass Derive : public Base{\r\n\r\n};\r\n\r\ntypedef void(*Fun)(void);\r\n\r\nvoid main() {\r\n    Derive d;\r\n    Fun  pFun = (Fun)*((int*)*(int*)(&d)+0);\r\n    pFun();\r\n\r\n}\r\n```\r\n\r\n## 5. 结束语\r\nC++这门语言是一门Magic的语言，对于程序员来说，我们似乎永远摸不清楚这门语言背着我们在干了什么。需要熟悉这门语言，我们就必需要了解C++里面的那些东西，需要去了解C++中那些危险的东西。\r\n## 6. 附录\r\n#### 6.1 VC中查看虚函数表\r\n以在VC的IDE环境中的Debug状态下展开类的实例就可以看到虚函数表了（并不是很完整的）\r\n![](https://laichao2018.github.io/post-images/1604645883090.JPG)\r\n#### 6.2 例程\r\n下面是一个关于多重继承的虚函数表访问的例程：\r\n```cpp\r\n#include <iostream>\r\nusing namespace std;\r\n\r\nclass Base1 {\r\n    public:\r\n            virtual void f() { cout << \"Base1::f\" << endl; }\r\n            virtual void g() { cout << \"Base1::g\" << endl; }\r\n            virtual void h() { cout << \"Base1::h\" << endl; }\r\n};\r\n\r\nclass Base2 {\r\n    public:\r\n            virtual void f() { cout << \"Base2::f\" << endl; }\r\n            virtual void g() { cout << \"Base2::g\" << endl; }\r\n            virtual void h() { cout << \"Base2::h\" << endl; }\r\n}; \r\n\r\nclass Base3 {\r\n    public:\r\n            virtual void f() { cout << \"Base3::f\" << endl; }\r\n            virtual void g() { cout << \"Base3::g\" << endl; }\r\n            virtual void h() { cout << \"Base3::h\" << endl; }\r\n};\r\n\r\nclass Derive : public Base1, public Base2, public Base3 {\r\n    public:\r\n            virtual void f() { cout << \"Derive::f\" << endl; }\r\n            virtual void g1() { cout << \"Derive::g1\" << endl; }\r\n};\r\n\r\ntypedef void(*Fun)(void);\r\n\r\nint main() {\r\n            Fun pFun = NULL;\r\n            Derive d;\r\n            int** pVtab = (int**)&d;\r\n            //Base1's vtable\r\n            //pFun = (Fun)*((int*)*(int*)((int*)&d+0)+0);\r\n            pFun = (Fun)pVtab[0][0];\r\n            pFun();\r\n            //pFun = (Fun)*((int*)*(int*)((int*)&d+0)+1);\r\n            pFun = (Fun)pVtab[0][1];\r\n            pFun();\r\n            //pFun = (Fun)*((int*)*(int*)((int*)&d+0)+2);\r\n            pFun = (Fun)pVtab[0][2];\r\n            pFun();\r\n            //Derive's vtable\r\n            //pFun = (Fun)*((int*)*(int*)((int*)&d+0)+3);\r\n            pFun = (Fun)pVtab[0][3];\r\n            pFun();\r\n            //The tail of the vta\r\n            pFun = (Fun)pVtab[0][4];\r\n            cout<<pFun<<endl;\r\n           \r\n            //Base2's vtable\r\n            //pFun = (Fun)*((int*)*(int*)((int*)&d+1)+0);\r\n            pFun = (Fun)pVtab[1][0];\r\n            pFun();\r\n            //pFun = (Fun)*((int*)*(int*)((int*)&d+1)+1);\r\n            pFun = (Fun)pVtab[1][1];\r\n            pFun();\r\n            pFun = (Fun)pVtab[1][2];\r\n            pFun();\r\n           \r\n            //The tail of the vtable\r\n            pFun = (Fun)pVtab[1][3];\r\n            cout<<pFun<<endl;\r\n           \r\n            //Base3's vtable\r\n            //pFun = (Fun)*((int*)*(int*)((int*)&d+1)+0);\r\n            pFun = (Fun)pVtab[2][0];\r\n            pFun();\r\n            //pFun = (Fun)*((int*)*(int*)((int*)&d+1)+1);\r\n\r\n            pFun = (Fun)pVtab[2][1];\r\n            pFun();\r\n            pFun = (Fun)pVtab[2][2];\r\n            pFun();\r\n\r\n            //The tail of the vtable\r\n            pFun = (Fun)pVtab[2][3];\r\n            cout<<pFun<<endl;\r\n            return 0;\r\n}\r\n```\r\n\r\n## 7. 参考博客\r\n+ [https://blog.csdn.net/lyztyycode/article/details/81326699](https://blog.csdn.net/lyztyycode/article/details/81326699)",
+      "data": {
+        "title": "[编程语言] C++虚函数与虚函数表",
+        "date": "2020-11-06 10:04:19",
+        "tags": [
+          "技术",
+          "面试"
+        ],
+        "published": true,
+        "hideInList": false,
+        "feature": "/post-images/bian-cheng-yu-yan-cxu-han-shu-yu-xu-han-shu-biao.jpg",
+        "isTop": false
+      },
+      "isEmpty": false,
+      "excerpt": "",
+      "abstract": "",
+      "fileName": "bian-cheng-yu-yan-cxu-han-shu-yu-xu-han-shu-biao"
+    },
+    {
+      "content": "## 1. 介绍\r\n+ submodule子模块，简单来讲就是Git仓库中的子仓库。\r\n+ 如果有一个模块是通用的，多个项目依赖这个模块；或者Github上要使用一个开源算法模块。但模块更新后，要怎么在自己的项目中保持同步更新甚至是提交呢？答案是使用Git Submodule。\r\n## 2. 用法\r\n### **2.1. 新增submodule**\r\n```cpp\r\ngit submodule add $giturl $foldername\r\n```\r\n其中<font color=red>＄giturl</font>表示git仓库地址，<font color=red>＄foldername</font>表示submodule的目录名，例如：\r\n```\r\ngit submodule add git://github.com/xx/A.git A\r\n```\r\n\r\n> 注：下面示例全部以 A 当做submodule所在目录\r\n\r\n完成后，将文件变化提交即可\r\n### **2.2. clone有submodule的git仓库**\r\n```\r\ngit clone $giturl\r\ngit submodule init\r\ngit submodule update\r\n```\r\n\r\n### **2.3. submodule A作者有更新，如何同步到我的项目？**\r\n**2.3.1 更新submodule A**\r\n```cpp\r\n cd A\r\n git pull\r\n```\r\n**2.3.2 回到主git仓库，查看状态，并提交**\r\n```cpp\r\n cd ..\r\n git status\r\n\r\n //输出结果有这样的内容，意思是submodule A有修改。add并提交即可\r\n modified:   A (new commits)\r\n\r\n git add .\r\n git commit -m 'update submodule'\r\n git push\r\n```\r\n**2.3.3 你的同事或者协作的开发者，如何更新？**\r\n```cpp\r\n git pull\r\n git submodule update\r\n```\r\n\r\n这些操作和status的内容一开始可能很难理解，这里讲一下关于submodule的设计理念：\r\n+ 主git仓库中存在<font color=red>.gitmodules</font>文件，它记录了submodule的基本信息。例如remote地址。\r\n+ 同时在某处记录了主git仓库所用的submodule的commit号。\r\n+ 主git仓库并不同步submodule中的所有代码，而是同步其remote地址和commit号，每个clone都是根据这两个信息自行到remote地址获取到该commit版本的内容。\r\n\r\n所以，如果你要更新submodule必须做上面的操作步骤。而你操作完成后，你的git仓库中submodule的commit号得到更新。这样，与你协作的开发者，就可以直接<font color=red>git pull</font>得到最新的submodule commit号，<font color=red>git submodule update</font>获取submodule该commit的代码。\r\n\r\n### **2.4. 主git仓库的开发者，同时也是submodule A的作者，如何在主git仓库修改A并同步？** \r\n如果理解了上面说的设计理念，那么这个操作非常简单。\r\n1. 修改A目录中的内容\r\n2. 提交并同步A\r\n```cpp\r\n cd A\r\n git add .\r\n git commit\r\n git push\r\n```\r\n3. 此时，就处于3.2的状态，按照3.2操作即可。\r\n\r\n### **2.5. 几个submodule都想更到最新**\r\n简便操作:\r\n```cpp\r\ngit submodule foreach git pull\r\n```\r\n这样所有submodule都更到最新了，add commit即可。\r\n\r\n## 3.原文链接\r\n+ [https://www.jianshu.com/p/384c73fe173f](https://www.jianshu.com/p/384c73fe173f)",
+      "data": {
+        "title": "[开发工具] Git Submodule的使用",
+        "date": "2020-11-05 21:19:17",
+        "tags": [
+          "技术"
+        ],
+        "published": true,
+        "hideInList": false,
+        "feature": "/post-images/kai-fa-gong-ju-git-submodule-de-shi-yong.jpg",
+        "isTop": false
+      },
+      "isEmpty": false,
+      "excerpt": "",
+      "abstract": "",
+      "fileName": "kai-fa-gong-ju-git-submodule-de-shi-yong"
+    },
+    {
+      "content": "👏👏👏 **欢迎来到我的个人主页** \r\n\r\n✍️✍️✍️ **这里是我的平常学习记录和学习感悟** ~~~ **博客复兴🤙🤙🤙**\r\n\r\n\r\n\r\n#### 指南针🎶🐱‍🐉🏄‍♂️\r\n\r\n[GitHub主页🎓](https://github.com/LAICHAO2018)\r\n\r\n\r\n\r\n## 个人技能🏅\r\n\r\n+ 🎓 熟练使用C/C++语言，熟悉OOP特性，熟悉常用数据结构，算法，设计模式\r\n\r\n+ 💼 熟悉点云匹配，点云过滤和点云去噪等点云算法，熟悉点云数据与影像数据多源融合算法。熟练使用PCL库，有良好的国内外论文文献查阅能力，有点云处理相关项目实践开发经验\r\n\r\n+ 👝 熟悉影像三维重建流程，主流的开源三维重建框架(SfM + MVS\\Bundler等)；熟悉计算机视觉和图像处理的基本算法，熟悉OpenCV图像开发库和常用图像视频协议规范\r\n\r\n+ 👜 熟练使用Visual Studio 开发平台，熟练掌握软件开发的调试技巧，掌握动态库编写，掌握C++/CLI等图形界面开发，熟悉Qt Creator开发环境，熟悉Qt绘图，布局和信号与槽等\r\n\r\n+ ☂️ 熟悉软件说明文档与开发日志的写作，有规范命名，写注释，缩进统一的良好编程习惯\r\n\r\n+ 🌂 熟练掌握MySQL数据库的部署，实施，排查，故障分析处理，有相关项目经验。具备数据库设计能力，熟悉存储过程与范式\r\n\r\n+ 👖 熟悉Linux系统、熟悉命令行操作模式和常用命令，了解python，shell等脚本语言，有使用TensorFlow框架的图像深度学习科研经验，熟练使用Vim等工具；\r\n\r\n+ 👕 自学HTML/CSS/JavaScript，对jQuery、Vue等前端框架有一定的了解\r\n\r\n+ 👒 熟练使用集中式项目管理工具SVN与分布式管理工具Git，掌握常用管理命令，有个人GitHub网站和项目；\r\n\r\n+ 🤴有使用TensorFlow与Caffe(C++)的深度学习科研经历，旨在通过学习实现点云与影像的特征匹配从而达到多源数据融合\r\n\r\n+ 🙅‍♂具备良好的沟通能力、很强的团队意识与责任心，尽职尽责，空闲时间常常学习充电\r\n\r\n+ 🕴有个人GitHub项目，和基于GitHub的个人网站[GitHub主页🎓](https://github.com/LAICHAO2018)，LeetCode刷题通过量约500题\r\n-------------------------------------------\r\n-------------------------------------------\r\n\r\n## 开发项目✍️\r\n#### 1️⃣ 地下电缆三维建模系统开发项目\r\n#### 📆 2018.9-2019.10  \r\n+ 项目描述⚔️：\r\n系统以C++为开发语言，以DirectX作为引擎的三维底层图形库，采用面向对象的方法和软件工程思想进行架构设计，将业务逻辑、数据、界面相分离的方法对软件进行模块化开发，通过建立多源空间数据模型，实现了地下电缆全要素空间数据的一体化管理、三维可视化与自动化建模。软件依次划分为数据库模块、工井模型渲染模块、三维建模模块、基础类库四个核心模块，每个模块负责不同的业务和功能，模块内高度封装，模块间相互独立，利用消息进行通信，实现了高内聚、低耦合的系统集成，代码管理使用TortoiseSVN。\r\n+ 项目职责🔨：\r\n    + 软件图形界面开发与设计，界面窗口间信息通信。\r\n    + 影像算法模块。以三维坐标点数据为基础，采用数字图像处理技术生成影像数据。全景影像数据三维展示，二维影像添加单位注记，影像数据显示与管理。\r\n    + 数据库引擎（MySQL）架构设计，存储地下电缆设施数据，数据主要分为结构化数据与非结构化数据：表与表之间主键、外键、视图的建立及多种地下电缆设备属性的增、删、查、改，更新电缆信息。\r\n    + 负责三维模型的导入导出管理，三维模型纹理贴图，使用AutoDesk FBX/C++SDK开发。\r\n -------------------------------------------\r\n#### 2️⃣ 车载激光点云处理系统\r\n#### 📆 2019.8-2020.6 \r\n+ 项目描述⚔️：\r\n车载激光点云处理系统是基于车载Lidar数据，自动提取道路中心线、特征地物，三维激光点云特征实体集等信息。特征地物点包括：桥头、隧道口、道路交叉口、道路指示牌、交通监控架、里程碑、电线杆、独立树、其他容易辨认长久存在且形状规则的地物。\r\n+ 项目职责🔨：\r\n    + 负责车载数据的车道线提取工作，采用点云生成二维影像方法，利用OpenCV库对影像目标进行阈值分割，边缘提取等操作进而转换回点云数据，进行标线提取；\r\n    + 使用C++/CLI搭建平台部分主界面与点云数字影像展示图形窗口的设计；\r\n    + 负责路灯提取；采用区域生长算法实现提取过程。\r\n -------------------------------------------\r\n #### 3️⃣ 北京市文物移动执法系统\r\n #### 📆 2018.10-2019.2 \r\n + 项目描述⚔️：\r\n该项目主旨为通过利用GPS定位，对移动执法平台的三维空间点云等各种数据实现调用、查询等功能，对地面现状文物建筑及周边环境的现场调查、局部测量、拍照、取证等，辅助文物执法人员对文物建筑的安全管理工作。\r\n+ 项目职责🔨：\r\n    + 模型数据影像匀光，滤波等处理。纹理映射，模型贴图，真实化三维模型；\r\n    + 对点云和模型数据通过包围盒建立空间渲染结构，进行多块点云及多个模型共同渲染。\r\n-------------------------------------------\r\n-------------------------------------------\r\n\r\n### 科研工作🎓\r\n+ 研究摘要\r\n多源点云数据融合相对于单一数据扩展了数据应用面，有助于提高点云利用率。通过不同方法得到的三维点云数据由于获取途径与设备误差的影响，不同数据之间往往存在着尺度不一致，初始位置相差大，噪声较大产生较大的特征误匹配等问题。本文使用三维重建点云对激光点云进行修复，提出一种适用不同尺度点云数据的**全局优化的自动点云融合**方法，融合结果与点云初始位置无关，并对噪声较大与特征错配率较高数据具有稳定性。通过从点云数据中提取特征描述信息进行匹配，并通过误匹配去除与几何相似筛选，将确定的点云对应关系代入含尺度变量的目标函数并逐一优化各个分量，计算结果作为初始值代入Scale-ICP中进行精确融合。实验表明本文方法在处理不同尺度含外点的实测数据时具有良好的融合结果。\r\n+ 研究成果\r\n    + 融合效果\r\n  ![](https://laichao2018.github.io/post-images/1604648653768.png)\r\n    + 融合精度\r\n  ![](https://laichao2018.github.io/post-images/1604648784527.png)\r\n\r\n\r\n### 获奖与证书✨\r\n+ ⭐️ 2015年获得大学英语四级证书\r\n+ ⭐️ 2017年获得大学英语六级证书\r\n+ ⭐️ 2016福建省测绘技能大赛二等奖\r\n+ ⭐️ 2018年度研究生学业奖学金\r\n+ ⭐️ 2019年度研究生学业奖学金\r\n\r\n\r\n\r\n",
+      "data": {
+        "title": "关于博主",
+        "date": "2020-08-24 15:37:49",
+        "tags": [],
+        "published": true,
+        "hideInList": false,
+        "feature": "/post-images/guan-yu-bo-zhu.jpg",
+        "isTop": true
+      },
+      "isEmpty": false,
+      "excerpt": "",
+      "abstract": "",
+      "fileName": "guan-yu-bo-zhu"
+    },
+    {
+      "content": "> 欢迎来到我的小站呀，很高兴遇见你！🤝\n\n## 🏠 关于本站\n\n## 👨‍💻 博主是谁\n\n## ⛹ 兴趣爱好\n\n## 📬 联系我呀\n",
+      "data": {
+        "title": "关于",
+        "date": "2019-01-25 19:09:48",
+        "tags": null,
+        "published": true,
+        "hideInList": true,
+        "feature": null,
+        "isTop": false
+      },
+      "isEmpty": false,
+      "excerpt": "",
+      "abstract": "",
+      "fileName": "about"
+    },
+    {
+      "content": "👏  欢迎使用 **Gridea** ！  \n✍️  **Gridea** 一个静态博客写作客户端。你可以用它来记录你的生活、心情、知识、笔记、创意... ... \n\n<!-- more -->\n\n[Github](https://github.com/getgridea/gridea)  \n[Gridea 主页](https://gridea.dev/)  \n[示例网站](http://fehey.com/)\n\n## 特性👇\n📝  你可以使用最酷的 **Markdown** 语法，进行快速创作  \n\n🌉  你可以给文章配上精美的封面图和在文章任意位置插入图片  \n\n🏷️  你可以对文章进行标签分组  \n\n📋  你可以自定义菜单，甚至可以创建外部链接菜单  \n\n💻  你可以在 **Windows**，**MacOS** 或 **Linux** 设备上使用此客户端  \n\n🌎  你可以使用 **𝖦𝗂𝗍𝗁𝗎𝖻 𝖯𝖺𝗀𝖾𝗌** 或 **Coding Pages** 向世界展示，未来将支持更多平台  \n\n💬  你可以进行简单的配置，接入 [Gitalk](https://github.com/gitalk/gitalk) 或 [DisqusJS](https://github.com/SukkaW/DisqusJS) 评论系统  \n\n🇬🇧  你可以使用**中文简体**或**英语**  \n\n🌁  你可以任意使用应用内默认主题或任意第三方主题，强大的主题自定义能力  \n\n🖥  你可以自定义源文件夹，利用 OneDrive、百度网盘、iCloud、Dropbox 等进行多设备同步  \n\n🌱 当然 **Gridea** 还很年轻，有很多不足，但请相信，它会不停向前 🏃\n\n未来，它一定会成为你离不开的伙伴\n\n尽情发挥你的才华吧！\n\n😘 Enjoy~\n",
+      "data": {
+        "title": "Hello Gridea",
+        "date": "2018-12-12 00:00:00",
+        "tags": [],
+        "published": true,
+        "hideInList": false,
+        "feature": "/post-images/hello-gridea.png",
+        "isTop": false
+      },
+      "isEmpty": false,
+      "excerpt": "",
+      "abstract": "👏  欢迎使用 **Gridea** ！  \n✍️  **Gridea** 一个静态博客写作客户端。你可以用它来记录你的生活、心情、知识、笔记、创意... ... ",
+      "fileName": "hello-gridea"
+    }
+  ],
+  "tags": [
+    {
+      "name": "SLAM",
+      "slug": "YbrgXMpIA",
+      "used": true
+    },
+    {
+      "name": "专业知识",
+      "slug": "aEL2NTSmpB",
+      "used": true
+    },
+    {
+      "name": "C++",
+      "slug": "sjGcA2JnD",
+      "used": true
+    },
+    {
+      "name": "面试",
+      "slug": "_S3u_74WG",
+      "used": true
+    },
+    {
+      "name": "技术",
+      "slug": "FQf9HdETR",
+      "used": true
+    },
+    {
+      "name": "Gridea",
+      "slug": "0PrCA8YYV",
+      "used": false
+    },
+    {
+      "index": -1,
+      "name": "回到首页",
+      "slug": "KkH0cXeNp",
+      "used": false
+    }
+  ],
+  "menus": [
+    {
+      "link": "/",
+      "name": "首页",
+      "openType": "Internal"
+    },
+    {
+      "link": "https://laichao2018.github.io/archives",
+      "name": "技术博客",
+      "openType": "Internal"
+    },
+    {
+      "link": "/tags",
+      "name": "刷题",
+      "openType": "Internal"
+    },
+    {
+      "link": "/post/about",
+      "name": "关于",
+      "openType": "Internal"
+    }
+  ]
+}

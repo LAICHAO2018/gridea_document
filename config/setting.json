@@ -1,0 +1,27 @@
+{
+  "config": {
+    "branch": "master",
+    "domain": "https://laichao2018.github.io",
+    "email": "",
+    "platform": "github",
+    "privateKey": "",
+    "repository": "laichao2018.github.io",
+    "token": "1d7ce981bd389800cb8ed2c589d4a8c9317852e9",
+    "username": "LAICHAO2018"
+  },
+  "comment": {
+    "commentPlatform": "gitalk",
+    "disqusSetting": {
+      "api": "",
+      "apikey": "",
+      "shortname": ""
+    },
+    "gitalkSetting": {
+      "clientId": "",
+      "clientSecret": "",
+      "owner": "",
+      "repository": ""
+    },
+    "showComment": true
+  }
+}
